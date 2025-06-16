@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Launches an EC2 instance preconfigured with SoftEther VPN and Elastic IP, optionally enabling SSM access.
+
+Metadata:
+  TemplateName: "SoftEther VPN EC2 with Elastic IP & Optional SSM"
+  Description: >
+    This template deploys an EC2 instance with SoftEther VPN installed via UserData, assigns a static Elastic IP, and
+    optionally attaches an IAM Role for AWS SSM Session Manager access.
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceName
+          - InstanceType
+          - KeyName
+          - LatestAmiId
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: "SSM Access"
+        Parameters:
+          - AttachSSMRole
+      - Label:
+          default: "Tags"
+        Parameters:
+          - Environment
+          - CreatedBy
+          - ProjectName
+    ParameterLabels:
+      KeyName:
+        default: "EC2 Key Pair"
+
+Parameters:
+  InstanceName:
+    Type: String
+    Default: "SoftEther-EC2"
+    Description: Name tag for the EC2 instance.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 Key Pair for SSH access.
+
+  LatestAmiId:
+    Type: String
+    Description: The AMI ID for the EC2 instance
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC for the EC2 instance.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the public subnet for the EC2 instance.
+
+  AttachSSMRole:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Attach an IAM Role to allow SSM Session Manager access.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: Environment name tag.
+
+  CreatedBy:
+    Type: String
+    Default: "Futuralis"
+    AllowedValues:
+      - Futuralis
+    Description: Creator tag for the stack.
+
+  ProjectName:
+    Type: String
+    Default: "SoftEtherVPN"
+    Description: Project name tag.
+
+Conditions:
+  UseSSMRole: !Equals [!Ref AttachSSMRole, "true"]
+
+Resources:
+
+  InstanceSSMRole:
+    Type: AWS::IAM::Role
+    Condition: UseSSMRole
+    Properties:
+      RoleName: !Sub "${InstanceName}-SSM-Role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: UseSSMRole
+    Properties:
+      Roles:
+        - !Ref InstanceSSMRole
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for SoftEther VPN Server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 992
+          ToPort: 992
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5555
+          ToPort: 5555
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${InstanceName}-SG"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CreatedBy
+          Value: !Ref CreatedBy
+        - Key: ProjectName
+          Value: !Ref ProjectName
+
+  SoftEtherInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !If [UseSSMRole, !Ref InstanceProfile, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CreatedBy
+          Value: !Ref CreatedBy
+        - Key: ProjectName
+          Value: !Ref ProjectName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum groupinstall "Development Tools" -y
+          cd /usr/local
+          wget https://www.softether-download.com/files/softether/v4.34-9745-rtm-2020.04.05-tree/Linux/SoftEther_VPN_Server/64bit_-_Intel_x64_or_AMD64/softether-vpnserver-v4.34-9745-rtm-2020.04.05-linux-x64-64bit.tar.gz
+          tar -xvzf softether-vpnserver-v4.34-9745-rtm-2020.04.05-linux-x64-64bit.tar.gz
+          cd vpnserver
+          yes 1 | make
+          mv /usr/local/vpnserver /usr/local/
+          cat << 'EOF' > /etc/init.d/vpnserver
+          #!/bin/sh
+          # chkconfig: 2345 99 01
+          # description: SoftEther VPN Server
+          DAEMON=/usr/local/vpnserver/vpnserver
+          LOCK=/var/lock/subsys/vpnserver
+          test -x $DAEMON || exit 0
+          case "$1" in
+            start)
+              $DAEMON start
+              touch $LOCK
+              ;;
+            stop)
+              $DAEMON stop
+              rm $LOCK
+              ;;
+            restart)
+              $DAEMON stop
+              sleep 3
+              $DAEMON start
+              ;;
+            *)
+              echo "Usage: $0 {start|stop|restart}"
+              exit 1
+          esac
+          exit 0
+          EOF
+          chmod 700 /etc/init.d/vpnserver
+          chkconfig --add vpnserver
+          /etc/init.d/vpnserver start
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  ElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref SoftEtherInstance
+      EIP: !Ref ElasticIP
+
+Outputs:
+  InstancePublicIP:
+    Description: Elastic IP of the SoftEther EC2 instance.
+    Value: !GetAtt ElasticIP.PublicIp
+
+  InstancePrivateIP:
+    Description: Private IP of the EC2 instance.
+    Value: !GetAtt SoftEtherInstance.PrivateIp
+
+  SSHCommand:
+    Description: Use this SSH command to connect to the instance.
+    Value: !Sub "ssh -i your-key.pem ec2-user@${ElasticIP}"
+
+  SSMStartCommand:
+    Condition: UseSSMRole
+    Description: Use this to connect via AWS SSM (if enabled).
+    Value: !Sub "aws ssm start-session --target ${SoftEtherInstance}"
